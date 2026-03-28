@@ -1,0 +1,29 @@
+name: NYC Edge Midnight Capture
+
+on:
+  schedule:
+    # Runs at 05:00 UTC = 01:00 AM EDT (UTC-4 during daylight saving)
+    # This is exactly midnight LST = start of the NWS reporting day
+    - cron: '0 5 * * *'
+  
+  # Allow manual trigger from GitHub Actions UI for testing
+  workflow_dispatch:
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Run midnight capture
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+        run: node capture.js
