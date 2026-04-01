@@ -9,7 +9,11 @@
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const NWS_POINT = 'https://api.weather.gov/points/40.781,-73.967';
-const DSM_URL = 'https://tgftp.nws.noaa.gov/data/raw/cd/cdus41.kokx.dsm.txt';
+const DSM_URLS = [
+  'https://tgftp.nws.noaa.gov/data/raw/cd/cdus41.kokx.dsm.txt',
+  'https://forecast.weather.gov/product.php?site=NWS&product=DSM&issuedby=NYC',
+  'https://mesonet.agron.iastate.edu/wx/afos/p.php?pil=DSMOKX&fmt=text'
+];
 
 const DSM_MAX_RETRIES = 12;
 const DSM_RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
@@ -155,17 +159,34 @@ async function runDSMJob() {
     console.log(`Attempt ${attempt}/${DSM_MAX_RETRIES} — fetching DSM...`);
 
     try {
-      const res = await fetch(DSM_URL, {
-        headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' }
-      });
+      let text = null;
 
-      if (!res.ok) {
-        console.warn(`DSM fetch returned ${res.status}, retrying in 5 minutes...`);
+      // Try each DSM URL in order until one works
+      for (const url of DSM_URLS) {
+        try {
+          const res = await fetch(url, {
+            headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' }
+          });
+          if (!res.ok) {
+            console.warn(`  ${url} returned ${res.status}`);
+            continue;
+          }
+          const t = await res.text();
+          if (t && t.includes('DSMNYC')) {
+            console.log(`  Got DSM from: ${url}`);
+            text = t;
+            break;
+          }
+        } catch(urlErr) {
+          console.warn(`  ${url} failed: ${urlErr.message}`);
+        }
+      }
+
+      if (!text) {
+        console.warn('All DSM URLs failed this attempt, retrying in 5 minutes...');
         await sleep(DSM_RETRY_INTERVAL_MS);
         continue;
       }
-
-      const text = await res.text();
       const parsed = parseDSMText(text);
 
       if (!parsed) {
