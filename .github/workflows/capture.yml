@@ -1,20 +1,26 @@
-name: NYC Edge Midnight Capture
+name: NYC Edge Snapshots
 
 on:
   schedule:
-    # Runs at 05:00 UTC = 01:00 AM EDT (UTC-4 during daylight saving)
-    # This is exactly midnight LST = start of the NWS reporting day
+    # 1AM EDT (05:00 UTC) — snapshot + score yesterday + 1AM DSM
     - cron: '0 5 * * *'
-  
-  # Allow manual trigger from GitHub Actions UI for testing
-  workflow_dispatch:
+    # 7:10AM EDT (11:10 UTC) — DSM check
+    - cron: '10 11 * * *'
+    # 1:10PM EDT (17:10 UTC) — DSM check
+    - cron: '10 17 * * *'
+    # 4:10PM EDT (20:10 UTC) — DSM check
+    - cron: '10 20 * * *'
+    # 7:10PM EDT (23:10 UTC) — DSM check
+    - cron: '10 23 * * *'
+  workflow_dispatch: # allow manual trigger
 
 jobs:
   capture:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 75
+
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Setup Node.js
@@ -22,7 +28,7 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Run midnight capture
+      - name: Run capture script
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
