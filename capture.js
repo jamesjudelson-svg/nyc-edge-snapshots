@@ -1,14 +1,22 @@
 // capture.js
-// Runs nightly at midnight EDT via GitHub Actions
-// Fetches NWS + Open-Meteo forecasts and saves to Supabase
+// Runs via GitHub Actions on multiple schedules:
+//   05:00 UTC (1AM EDT)  — snapshot + score yesterday
+//   11:10 UTC (7:10AM EDT)  — DSM check
+//   17:10 UTC (1:10PM EDT)  — DSM check
+//   20:10 UTC (4:10PM EDT)  — DSM check
+//   23:10 UTC (7:10PM EDT)  — DSM check
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const NWS_POINT = 'https://api.weather.gov/points/40.781,-73.967';
+const DSM_URL = 'https://tgftp.nws.noaa.gov/data/raw/cd/cdus41.kokx.dsm.txt';
+
+const DSM_MAX_RETRIES = 12;
+const DSM_RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function cToF(c) { return Math.round(c * 9/5 + 32); }
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 function windDegToDir(deg) {
   if (deg == null) return '—';
@@ -23,41 +31,179 @@ function windRegime(dir) {
   return 'S/SE';
 }
 
-// Get tomorrow's date in Eastern time as YYYY-MM-DD
-// This runs at midnight EDT so "tomorrow" = the day we're forecasting
-function getTomorrowEastern() {
-  const now = new Date();
-  // Convert to Eastern time
-  const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  // Add one day (since we run at midnight EDT, tomorrow = the forecast day)
-  eastern.setDate(eastern.getDate() + 1);
-  return eastern.toISOString().slice(0, 10);
-}
-
-// Get today's date in Eastern time (the date whose LST window starts at 1AM EDT tonight)
 function getTodayEastern() {
   const now = new Date();
   const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
-  return eastern.toISOString().slice(0, 10);
+  const y = eastern.getFullYear();
+  const m = String(eastern.getMonth() + 1).padStart(2, '0');
+  const d = String(eastern.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
 }
 
-// LST window: 1AM EDT today through 12:59AM EDT tomorrow (during DST)
-// The forecast date is "today" Eastern — the day whose CLI will resolve tomorrow night
 function getLSTWindow(dateStr) {
-  // Start: 1:00AM EDT on dateStr
   const start = new Date(`${dateStr}T01:00:00`);
-  // End: 12:59AM EDT on dateStr+1
   const end = new Date(`${dateStr}T00:59:59`);
   end.setDate(end.getDate() + 1);
   return { start, end };
+}
+
+// Detect which job this is based on current UTC hour
+// Returns 'snapshot' or 'dsm'
+function detectJobType() {
+  const utcHour = new Date().getUTCHours();
+  // 05:00 UTC = 1AM EDT = snapshot job
+  if (utcHour >= 4 && utcHour <= 6) return 'snapshot';
+  return 'dsm';
+}
+
+// ── DSM ───────────────────────────────────────────────────────────────────────
+
+function parseDSMText(text) {
+  if (!text || !text.includes('DSMNYC')) return null;
+
+  // Parse issuance timestamp from header e.g. "CXUS41 KOKX 011500"
+  // Format: CXUS41 KOKX DDHHMM where DD=day, HHMM=UTC time
+  const headerMatch = text.match(/CXUS41 KOKX (\d{2})(\d{2})(\d{2})/);
+  if (!headerMatch) return null;
+  const issuanceUTCHour = parseInt(headerMatch[2]);
+  const issuanceUTCMin = parseInt(headerMatch[3]);
+
+  // Parse high/low from DSM data line
+  // Format: KNYC DS HHMM DD/MM HHTTTT/ LLTTTT//
+  const dataMatch = text.match(/KNYC DS (\d{4}) (\d{2})\/(\d{2})\s+(\d+)(\d{4})\/\s*(\d+)(\d{4})/);
+  if (!dataMatch) return null;
+
+  const high = parseInt(dataMatch[4]);
+  const highTimeLST = dataMatch[5]; // HHMM in LST
+  const low = parseInt(dataMatch[6]);
+  const lowTimeLST = dataMatch[7];
+
+  // Convert LST times to EDT (LST + 1hr during DST)
+  const highH = parseInt(highTimeLST.slice(0, 2)) + 1;
+  const highM = highTimeLST.slice(2, 4);
+  const lowH = parseInt(lowTimeLST.slice(0, 2)) + 1;
+  const lowM = lowTimeLST.slice(2, 4);
+
+  const highTimeStr = `${String(highH).padStart(2, '0')}:${highM} EDT`;
+  const lowTimeStr = `${String(lowH).padStart(2, '0')}:${lowM} EDT`;
+
+  // Build issuance UTC string for comparison (HHMM as zero-padded string)
+  const issuanceKey = `${String(issuanceUTCHour).padStart(2, '0')}${String(issuanceUTCMin).padStart(2, '0')}`;
+
+  return { high, low, highTimeStr, lowTimeStr, issuanceKey, issuanceUTCHour, issuanceUTCMin };
+}
+
+async function getLastDSMIssuanceKey(date) {
+  // Read most recent DSM entry for today from Supabase
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/dsm_reports?date=eq.${date}&order=captured_at.desc&limit=1`,
+      { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
+    );
+    if (!res.ok) return null;
+    const rows = await res.json();
+    return rows.length ? rows[0].issuance_key : null;
+  } catch(e) {
+    console.warn('Could not read last DSM from Supabase:', e.message);
+    return null;
+  }
+}
+
+async function saveDSM(date, parsed) {
+  const record = {
+    date,
+    captured_at: new Date().toISOString(),
+    high: parsed.high,
+    low: parsed.low,
+    high_time_str: parsed.highTimeStr,
+    low_time_str: parsed.lowTimeStr,
+    issuance_key: parsed.issuanceKey
+  };
+
+  const res = await fetch(`${SUPABASE_URL}/rest/v1/dsm_reports`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
+      'apikey': SUPABASE_SERVICE_KEY,
+      'Prefer': 'resolution=merge-duplicates'
+    },
+    body: JSON.stringify(record)
+  });
+
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`DSM save failed: ${res.status} - ${err}`);
+  }
+
+  console.log(`✅ DSM saved: high=${parsed.high}°F @ ${parsed.highTimeStr}, low=${parsed.low}°F @ ${parsed.lowTimeStr} (issuance key: ${parsed.issuanceKey})`);
+  return record;
+}
+
+async function runDSMJob() {
+  const date = getTodayEastern();
+  console.log(`=== DSM Check Job — ${date} ===`);
+
+  // Get the last issuance key we already have for today
+  const lastKey = await getLastDSMIssuanceKey(date);
+  console.log(`Last known DSM issuance key: ${lastKey || 'none'}`);
+
+  let attempt = 0;
+
+  while (attempt < DSM_MAX_RETRIES) {
+    attempt++;
+    console.log(`Attempt ${attempt}/${DSM_MAX_RETRIES} — fetching DSM...`);
+
+    try {
+      const res = await fetch(DSM_URL, {
+        headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' }
+      });
+
+      if (!res.ok) {
+        console.warn(`DSM fetch returned ${res.status}, retrying in 5 minutes...`);
+        await sleep(DSM_RETRY_INTERVAL_MS);
+        continue;
+      }
+
+      const text = await res.text();
+      const parsed = parseDSMText(text);
+
+      if (!parsed) {
+        console.warn('Could not parse DSM text, retrying in 5 minutes...');
+        await sleep(DSM_RETRY_INTERVAL_MS);
+        continue;
+      }
+
+      console.log(`DSM issuance key: ${parsed.issuanceKey} (last known: ${lastKey || 'none'})`);
+
+      if (parsed.issuanceKey === lastKey) {
+        console.log('DSM not updated yet, retrying in 5 minutes...');
+        await sleep(DSM_RETRY_INTERVAL_MS);
+        continue;
+      }
+
+      // New DSM — save it
+      await saveDSM(date, parsed);
+      console.log('DSM job complete.');
+      return;
+
+    } catch(e) {
+      console.warn(`Attempt ${attempt} failed: ${e.message}`);
+      if (attempt < DSM_MAX_RETRIES) {
+        console.log('Retrying in 5 minutes...');
+        await sleep(DSM_RETRY_INTERVAL_MS);
+      }
+    }
+  }
+
+  console.error(`❌ DSM job exhausted ${DSM_MAX_RETRIES} retries without finding a new issuance. NWS may be delayed or down.`);
 }
 
 // ── Fetch NWS ─────────────────────────────────────────────────────────────────
 
 async function fetchNWS(forecastDate) {
   console.log('Fetching NWS forecast...');
-  
-  // Get forecast URL from points API
+
   const pointsRes = await fetch(NWS_POINT, {
     headers: { 'User-Agent': 'nyc-edge-snapshots/1.0' }
   });
@@ -65,7 +211,6 @@ async function fetchNWS(forecastDate) {
   const pointsData = await pointsRes.json();
   const forecastHourlyUrl = pointsData.properties.forecastHourly;
 
-  // Fetch hourly forecast
   const forecastRes = await fetch(forecastHourlyUrl, {
     headers: { 'User-Agent': 'nyc-edge-snapshots/1.0' }
   });
@@ -75,24 +220,19 @@ async function fetchNWS(forecastDate) {
   const periods = forecastData.properties.periods;
   const { start, end } = getLSTWindow(forecastDate);
 
-  // Filter to LST window for the forecast date
   const windowPeriods = periods.filter(p => {
     const t = new Date(p.startTime);
     return t >= start && t <= end;
   });
 
-  if (!windowPeriods.length) {
-    console.warn('No NWS periods found in LST window, using all periods for date');
-  }
-
-  const targetPeriods = windowPeriods.length ? windowPeriods : 
+  const targetPeriods = windowPeriods.length ? windowPeriods :
     periods.filter(p => new Date(p.startTime).toISOString().slice(0,10) === forecastDate);
 
   let nwsHigh = null, nwsLow = null;
   const hourly = [];
 
   targetPeriods.forEach(p => {
-    const temp = p.temperature; // Already in F for US
+    const temp = p.temperature;
     if (nwsHigh === null || temp > nwsHigh) nwsHigh = temp;
     if (nwsLow === null || temp < nwsLow) nwsLow = temp;
     hourly.push({
@@ -104,14 +244,13 @@ async function fetchNWS(forecastDate) {
     });
   });
 
-  // Dominant afternoon wind direction (1PM-5PM EDT)
   const afternoonPeriods = targetPeriods.filter(p => {
     const h = new Date(p.startTime).getHours();
     return h >= 13 && h <= 17;
   });
   const windDirs = afternoonPeriods.map(p => p.windDirection).filter(Boolean);
-  const domDir = windDirs.length ? 
-    windDirs.sort((a,b) => windDirs.filter(v=>v===a).length - windDirs.filter(v=>v===b).length).pop() 
+  const domDir = windDirs.length ?
+    windDirs.sort((a,b) => windDirs.filter(v=>v===a).length - windDirs.filter(v=>v===b).length).pop()
     : '—';
 
   console.log(`NWS: high=${nwsHigh}°F low=${nwsLow}°F wind=${domDir}`);
@@ -122,11 +261,12 @@ async function fetchNWS(forecastDate) {
 
 async function fetchModel(forecastDate) {
   console.log('Fetching Open-Meteo model...');
-  
+
   const url = [
     'https://api.open-meteo.com/v1/gfs',
     '?latitude=40.7812&longitude=-73.9665',
     '&hourly=temperature_2m,windspeed_10m,winddirection_10m,cloudcover,dewpoint_2m,precipitation_probability',
+    '&daily=temperature_2m_max,temperature_2m_min',
     '&temperature_unit=fahrenheit',
     '&windspeed_unit=mph',
     '&forecast_days=3',
@@ -137,29 +277,25 @@ async function fetchModel(forecastDate) {
   if (!res.ok) throw new Error(`Open-Meteo failed: ${res.status}`);
   const data = await res.json();
 
-  const { start, end } = getLSTWindow(forecastDate);
-  // Also include hour 0 of next day
   const nextDate = new Date(forecastDate + 'T12:00:00');
   nextDate.setDate(nextDate.getDate() + 1);
   const nextDateStr = nextDate.toISOString().slice(0, 10);
 
-  let modelHigh = null, modelLow = null;
-  const hourly = [];
+  // Use daily max/min as model high/low (captures intra-hour peaks)
+  const dateIdx = data.daily.time.indexOf(forecastDate);
+  const modelHigh = dateIdx >= 0 ? Math.round(data.daily.temperature_2m_max[dateIdx]) : null;
+  const modelLow = dateIdx >= 0 ? Math.round(data.daily.temperature_2m_min[dateIdx]) : null;
 
+  const hourly = [];
   data.hourly.time.forEach((t, i) => {
     const tDate = t.slice(0, 10);
     const tHour = parseInt(t.slice(11, 13));
-    // LST window: hours 1-23 of forecastDate + hour 0 of nextDate
-    const inWindow = (tDate === forecastDate && tHour >= 1) || 
+    const inWindow = (tDate === forecastDate && tHour >= 1) ||
                      (tDate === nextDateStr && tHour === 0);
-    
     if (inWindow) {
-      const temp = Math.round(data.hourly.temperature_2m[i]);
-      if (modelHigh === null || temp > modelHigh) modelHigh = temp;
-      if (modelLow === null || temp < modelLow) modelLow = temp;
       hourly.push({
         time: t,
-        temp,
+        temp: Math.round(data.hourly.temperature_2m[i]),
         wind_dir: windDegToDir(data.hourly.winddirection_10m[i]),
         wind_speed: data.hourly.windspeed_10m[i],
         cloud: data.hourly.cloudcover[i],
@@ -169,11 +305,10 @@ async function fetchModel(forecastDate) {
     }
   });
 
-  // Dominant afternoon wind (1PM-5PM)
   const afHours = data.hourly.time
     .map((t, i) => ({ t, i, hour: parseInt(t.slice(11,13)), date: t.slice(0,10) }))
     .filter(({date, hour}) => date === forecastDate && hour >= 13 && hour <= 17);
-  
+
   const afDirs = afHours.map(({i}) => windDegToDir(data.hourly.winddirection_10m[i])).filter(d => d !== '—');
   const domDir = afDirs.length ?
     afDirs.sort((a,b) => afDirs.filter(v=>v===a).length - afDirs.filter(v=>v===b).length).pop()
@@ -183,11 +318,11 @@ async function fetchModel(forecastDate) {
   return { modelHigh, modelLow, domDir, hourly };
 }
 
-// ── Save to Supabase ──────────────────────────────────────────────────────────
+// ── Save Snapshot ─────────────────────────────────────────────────────────────
 
 async function saveSnapshot(forecastDate, nwsData, modelData) {
   const regime = windRegime(nwsData.domDir);
-  
+
   const snapshot = {
     date: forecastDate,
     captured_at: new Date().toISOString(),
@@ -200,9 +335,6 @@ async function saveSnapshot(forecastDate, nwsData, modelData) {
     nws_hourly: nwsData.hourly,
     model_hourly: modelData.hourly
   };
-
-  console.log('Saving snapshot to Supabase...');
-  console.log(JSON.stringify(snapshot, null, 2));
 
   const res = await fetch(`${SUPABASE_URL}/rest/v1/snapshots`, {
     method: 'POST',
@@ -227,23 +359,19 @@ async function saveSnapshot(forecastDate, nwsData, modelData) {
 // ── Score Yesterday ───────────────────────────────────────────────────────────
 
 async function scoreYesterday() {
-  // Get yesterday's date in Eastern time
   const now = new Date();
   const eastern = new Date(now.toLocaleString('en-US', { timeZone: 'America/New_York' }));
   eastern.setDate(eastern.getDate() - 1);
-  const yesterday = eastern.toISOString().slice(0, 10);
+  const y = eastern.getFullYear();
+  const m = String(eastern.getMonth() + 1).padStart(2, '0');
+  const d = String(eastern.getDate()).padStart(2, '0');
+  const yesterday = `${y}-${m}-${d}`;
 
   console.log(`Attempting to score ${yesterday}...`);
 
-  // Check if already scored
   const checkRes = await fetch(
     `${SUPABASE_URL}/rest/v1/scored_days?date=eq.${yesterday}`,
-    {
-      headers: {
-        'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
-        'apikey': SUPABASE_SERVICE_KEY
-      }
-    }
+    { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
   );
   const existing = await checkRes.json();
   if (existing.length > 0) {
@@ -251,15 +379,9 @@ async function scoreYesterday() {
     return;
   }
 
-  // Get yesterday's snapshot
   const snapRes = await fetch(
     `${SUPABASE_URL}/rest/v1/snapshots?date=eq.${yesterday}`,
-    {
-      headers: {
-        'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
-        'apikey': SUPABASE_SERVICE_KEY
-      }
-    }
+    { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
   );
   const snaps = await snapRes.json();
   if (!snaps.length) {
@@ -268,20 +390,16 @@ async function scoreYesterday() {
   }
   const snap = snaps[0];
 
-  // Fetch CLI report
   const CLI_URL = 'https://forecast.weather.gov/product.php?site=OKX&product=CLI&issuedby=NYC';
   let cliText = null;
   try {
-    const cliRes = await fetch(CLI_URL, {
-      headers: { 'User-Agent': 'nyc-edge-snapshots/1.0' }
-    });
+    const cliRes = await fetch(CLI_URL, { headers: { 'User-Agent': 'nyc-edge-snapshots/1.0' } });
     cliText = await cliRes.text();
   } catch(e) {
     console.log('CLI fetch failed:', e.message);
     return;
   }
 
-  // Parse CLI
   const dateMatch = cliText.match(/CLIMATE SUMMARY FOR (\w+ \d+ \d+)/);
   const maxMatch = cliText.match(/MAXIMUM\s+(\d+)\s/);
   const minMatch = cliText.match(/MINIMUM\s+(\d+)\s/);
@@ -333,7 +451,7 @@ async function scoreYesterday() {
 
   if (!saveRes.ok) {
     const err = await saveRes.text();
-    throw new Error(`Supabase score save failed: ${saveRes.status} - ${err}`);
+    throw new Error(`Score save failed: ${saveRes.status} - ${err}`);
   }
 
   console.log(`✅ Scored ${yesterday}: actual high=${actualHigh}°F low=${actualLow}°F`);
@@ -341,37 +459,51 @@ async function scoreYesterday() {
   console.log(`   Winner high: ${scored.winner_high} | Winner low: ${scored.winner_low}`);
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
+// ── Snapshot Job ──────────────────────────────────────────────────────────────
 
-async function main() {
-  console.log('=== NYC Edge Midnight Capture ===');
-  console.log(`Time: ${new Date().toISOString()}`);
+async function runSnapshotJob() {
+  const forecastDate = getTodayEastern();
+  console.log(`=== Snapshot Job — ${forecastDate} ===`);
 
-  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
-    throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY environment variables');
+  // Also grab the 1AM DSM while we're here
+  try {
+    await runDSMJob();
+  } catch(e) {
+    console.warn('DSM capture during snapshot job failed:', e.message);
   }
 
-  // The forecast date = today in Eastern time
-  // (script runs at midnight EDT, so "today" = the day whose LST window just started)
-  const forecastDate = getTodayEastern();
-  console.log(`Forecast date: ${forecastDate}`);
-
   try {
-    // 1. Score yesterday (if CLI is available)
     await scoreYesterday();
   } catch(e) {
     console.error('Scoring failed:', e.message);
-    // Don't abort — continue to snapshot
   }
 
   try {
-    // 2. Capture tonight's snapshot
     const nwsData = await fetchNWS(forecastDate);
     const modelData = await fetchModel(forecastDate);
     await saveSnapshot(forecastDate, nwsData, modelData);
   } catch(e) {
     console.error('Snapshot failed:', e.message);
     process.exit(1);
+  }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────────────
+
+async function main() {
+  console.log(`Time: ${new Date().toISOString()}`);
+
+  if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) {
+    throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY');
+  }
+
+  const jobType = detectJobType();
+  console.log(`Job type detected: ${jobType}`);
+
+  if (jobType === 'snapshot') {
+    await runSnapshotJob();
+  } else {
+    await runDSMJob();
   }
 
   console.log('=== Done ===');
