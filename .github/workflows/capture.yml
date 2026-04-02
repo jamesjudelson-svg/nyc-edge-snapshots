@@ -2,8 +2,10 @@ name: NYC Edge Snapshots
 
 on:
   schedule:
-    # 1AM EDT (05:00 UTC) — snapshot + score yesterday + 1AM DSM
+    # 1AM EDT (05:00 UTC) — snapshot + attempt score + 1AM DSM
     - cron: '0 5 * * *'
+    # 3AM EDT (07:00 UTC) — score only (catches CLI which posts ~2:30AM)
+    - cron: '0 7 * * *'
     # 7:10AM EDT (11:10 UTC) — DSM check
     - cron: '10 11 * * *'
     # 1:10PM EDT (17:10 UTC) — DSM check
