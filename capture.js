@@ -52,11 +52,11 @@ function getLSTWindow(dateStr) {
 }
 
 // Detect which job this is based on current UTC hour
-// Returns 'snapshot' or 'dsm'
+// Returns 'snapshot', 'score', or 'dsm'
 function detectJobType() {
   const utcHour = new Date().getUTCHours();
-  // 05:00 UTC = 1AM EDT = snapshot job
-  if (utcHour >= 4 && utcHour <= 6) return 'snapshot';
+  if (utcHour >= 4 && utcHour <= 6) return 'snapshot'; // 1AM EDT
+  if (utcHour >= 7 && utcHour <= 8) return 'score';    // 3AM EDT
   return 'dsm';
 }
 
@@ -390,6 +390,7 @@ async function scoreYesterday() {
 
   console.log(`Attempting to score ${yesterday}...`);
 
+  // Check if already scored
   const checkRes = await fetch(
     `${SUPABASE_URL}/rest/v1/scored_days?date=eq.${yesterday}`,
     { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
@@ -400,6 +401,7 @@ async function scoreYesterday() {
     return;
   }
 
+  // Get yesterday's snapshot
   const snapRes = await fetch(
     `${SUPABASE_URL}/rest/v1/snapshots?date=eq.${yesterday}`,
     { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
@@ -411,6 +413,7 @@ async function scoreYesterday() {
   }
   const snap = snaps[0];
 
+  // Fetch CLI — the official ground truth Kalshi resolves against
   const CLI_URL = 'https://forecast.weather.gov/product.php?site=OKX&product=CLI&issuedby=NYC';
   let cliText = null;
   try {
@@ -426,19 +429,45 @@ async function scoreYesterday() {
   const minMatch = cliText.match(/MINIMUM\s+(\d+)\s/);
 
   if (!dateMatch || !maxMatch || !minMatch) {
-    console.log('Could not parse CLI report');
+    console.log('Could not parse CLI report — may not be posted yet');
     return;
   }
 
   const cliDate = new Date(dateMatch[1] + ' 12:00:00 EDT').toISOString().slice(0, 10);
   if (cliDate !== yesterday) {
-    console.log(`CLI date ${cliDate} doesn't match yesterday ${yesterday}`);
+    console.log(`CLI date ${cliDate} doesn't match yesterday ${yesterday} — not posted yet`);
     return;
   }
 
   const actualHigh = parseInt(maxMatch[1]);
   const actualLow = parseInt(minMatch[1]);
 
+  console.log(`CLI confirmed: high=${actualHigh}°F low=${actualLow}°F — this is the official Kalshi resolution value`);
+
+  // Save to cli_reports — permanent official record
+  const cliRecord = {
+    date: yesterday,
+    captured_at: new Date().toISOString(),
+    actual_high: actualHigh,
+    actual_low: actualLow
+  };
+  const cliSaveRes = await fetch(`${SUPABASE_URL}/rest/v1/cli_reports`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
+      'apikey': SUPABASE_SERVICE_KEY,
+      'Prefer': 'resolution=merge-duplicates'
+    },
+    body: JSON.stringify(cliRecord)
+  });
+  if (!cliSaveRes.ok) {
+    console.warn('cli_reports save failed:', await cliSaveRes.text());
+  } else {
+    console.log(`✅ CLI report saved to cli_reports for ${yesterday}`);
+  }
+
+  // Score against snapshot
   const scored = {
     date: yesterday,
     nws_high: snap.nws_high,
@@ -480,6 +509,20 @@ async function scoreYesterday() {
   console.log(`   Winner high: ${scored.winner_high} | Winner low: ${scored.winner_low}`);
 }
 
+// ── Score Job (3AM EDT) ───────────────────────────────────────────────────────
+
+async function runScoreJob() {
+  console.log('=== Score Job (3AM — CLI final verdict) ===');
+  // Primary purpose: catch the CLI which posts ~2:30AM
+  // This is the official Kalshi resolution value
+  try {
+    await scoreYesterday();
+  } catch(e) {
+    console.error('Scoring failed:', e.message);
+    process.exit(1);
+  }
+}
+
 // ── Snapshot Job ──────────────────────────────────────────────────────────────
 
 async function runSnapshotJob() {
@@ -493,6 +536,8 @@ async function runSnapshotJob() {
     console.warn('DSM capture during snapshot job failed:', e.message);
   }
 
+  // Attempt scoring — CLI may not be posted yet at 1AM, that's ok
+  // The 3AM score job will catch it reliably
   try {
     await scoreYesterday();
   } catch(e) {
@@ -523,6 +568,8 @@ async function main() {
 
   if (jobType === 'snapshot') {
     await runSnapshotJob();
+  } else if (jobType === 'score') {
+    await runScoreJob();
   } else {
     await runDSMJob();
   }
