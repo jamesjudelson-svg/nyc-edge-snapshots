@@ -55,26 +55,46 @@ function getLSTWindow(dateStr) {
 // Returns 'snapshot', 'score', or 'dsm'
 function detectJobType() {
   const utcHour = new Date().getUTCHours();
-  if (utcHour >= 4 && utcHour <= 6) return 'snapshot'; // 1AM EDT
-  if (utcHour >= 7 && utcHour <= 8) return 'score';    // 3AM EDT
+  const utcMin = new Date().getUTCMinutes();
+  const utcDecimal = utcHour + utcMin / 60;
+  // Snapshot cron: 0 5 * * * (05:00 UTC = 1AM EDT), allow up to 90min late
+  if (utcDecimal >= 4.5 && utcDecimal < 6.5) return 'snapshot';
+  // Score cron: 0 7 * * * (07:00 UTC = 3AM EDT), allow up to 90min late
+  if (utcDecimal >= 6.5 && utcDecimal < 9.0) return 'score';
   return 'dsm';
 }
 
 // ── DSM ───────────────────────────────────────────────────────────────────────
 
 function parseDSMText(text) {
-  if (!text || !text.includes('DSMNYC')) return null;
+  if (!text) return null;
+
+  // forecast.weather.gov returns HTML — extract the pre tag content
+  // tgftp returns raw text directly
+  let raw = text;
+  if (text.includes('<html') || text.includes('<HTML')) {
+    // Extract content from <pre> tag which contains the raw product text
+    const preMatch = text.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
+    if (preMatch) {
+      raw = preMatch[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>');
+    } else {
+      // Try to find DSMNYC directly in the HTML
+      const dsmIdx = text.indexOf('DSMNYC');
+      if (dsmIdx === -1) return null;
+      raw = text.slice(dsmIdx - 100, dsmIdx + 500);
+    }
+  }
+
+  if (!raw.includes('DSMNYC')) return null;
 
   // Parse issuance timestamp from header e.g. "CXUS41 KOKX 011500"
-  // Format: CXUS41 KOKX DDHHMM where DD=day, HHMM=UTC time
-  const headerMatch = text.match(/CXUS41 KOKX (\d{2})(\d{2})(\d{2})/);
+  const headerMatch = raw.match(/CXUS41 KOKX (\d{2})(\d{2})(\d{2})/);
   if (!headerMatch) return null;
   const issuanceUTCHour = parseInt(headerMatch[2]);
   const issuanceUTCMin = parseInt(headerMatch[3]);
 
   // Parse high/low from DSM data line
-  // Format: KNYC DS HHMM DD/MM HHTTTT/ LLTTTT//
-  const dataMatch = text.match(/KNYC DS (\d{4}) (\d{2})\/(\d{2})\s+(\d+)(\d{4})\/\s*(\d+)(\d{4})/);
+  const dataMatch = raw.match(/KNYC DS (\d{4}) (\d{2})\/(\d{2})\s+(\d+)(\d{4})\/\s*(\d+)(\d{4})/);
   if (!dataMatch) return null;
 
   const high = parseInt(dataMatch[4]);
@@ -205,6 +225,14 @@ async function runDSMJob() {
 
       // New DSM — save it
       await saveDSM(date, parsed);
+
+      // Send GFS notification on the 7AM DSM job — this is when the 06Z run
+      // is confirmed available, the most actionable pre-market update
+      const utcHour = new Date().getUTCHours();
+      if (utcHour >= 11 && utcHour <= 12) {
+        await sendGFSNotification(date);
+      }
+
       console.log('DSM job complete.');
       return;
 
@@ -220,7 +248,72 @@ async function runDSMJob() {
   console.error(`❌ DSM job exhausted ${DSM_MAX_RETRIES} retries without finding a new issuance. NWS may be delayed or down.`);
 }
 
-// ── Fetch NWS ─────────────────────────────────────────────────────────────────
+// ── Email Notification ────────────────────────────────────────────────────────
+
+async function sendGFSNotification(forecastDate) {
+  const GMAIL_USER = process.env.GMAIL_USER;
+  const GMAIL_PASS = process.env.GMAIL_APP_PASSWORD;
+  const NOTIFY_EMAIL = process.env.NOTIFY_EMAIL;
+
+  if (!GMAIL_USER || !GMAIL_PASS || !NOTIFY_EMAIL) {
+    console.log('Email credentials not configured, skipping notification');
+    return;
+  }
+
+  // Get latest forecast data from Supabase to include in email
+  let snapInfo = '';
+  try {
+    const res = await fetch(
+      `${SUPABASE_URL}/rest/v1/snapshots?order=date.desc&limit=1`,
+      { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
+    );
+    if (res.ok) {
+      const rows = await res.json();
+      if (rows.length) {
+        const s = rows[0];
+        const div = s.model_high != null && s.nws_high != null ? s.model_high - s.nws_high : null;
+        snapInfo = `
+Forecast for ${s.date}:
+  NWS High: ${s.nws_high}°F
+  Model High: ${s.model_high}°F
+  Divergence: ${div != null ? (div > 0 ? '+' : '') + div + '°F' : '—'}
+  Regime: ${s.wind_regime || '—'}`;
+      }
+    }
+  } catch(e) {
+    console.warn('Could not fetch snapshot for email:', e.message);
+  }
+
+  // Determine which GFS run just became available
+  const utcHour = new Date().getUTCHours();
+  const runZ = Math.floor((utcHour - 2) / 6) * 6; // approximate
+  const runLabel = `${String(Math.max(0, runZ)).padStart(2, '0')}Z`;
+
+  const subject = `GFS ${runLabel} Now Live — NYC Edge`;
+  const body = `GFS ${runLabel} run is now fully available on Open-Meteo.${snapInfo}
+
+Act now if you have a position to take.
+
+-- NYC Edge Pipeline`;
+
+  // Send via Gmail SMTP using nodemailer
+  try {
+    const nodemailer = await import('nodemailer');
+    const transporter = nodemailer.default.createTransport({
+      service: 'gmail',
+      auth: { user: GMAIL_USER, pass: GMAIL_PASS }
+    });
+    await transporter.sendMail({
+      from: GMAIL_USER,
+      to: NOTIFY_EMAIL,
+      subject,
+      text: body
+    });
+    console.log(`✅ GFS notification email sent to ${NOTIFY_EMAIL}`);
+  } catch(e) {
+    console.warn('Email send failed:', e.message);
+  }
+}
 
 async function fetchNWS(forecastDate) {
   console.log('Fetching NWS forecast...');
