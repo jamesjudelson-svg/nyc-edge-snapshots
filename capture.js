@@ -620,13 +620,11 @@ async function scoreYesterday() {
 
 async function runScoreJob() {
   console.log('=== Score Job (3AM — CLI final verdict) ===');
-  // Primary purpose: catch the CLI which posts ~2:30AM
-  // This is the official Kalshi resolution value
   try {
     await scoreYesterday();
   } catch(e) {
-    console.error('Scoring failed:', e.message);
-    process.exit(1);
+    // Log but don't exit with code 1 — a scoring miss is not fatal
+    console.warn('Scoring failed (non-fatal):', e.message);
   }
 }
 
