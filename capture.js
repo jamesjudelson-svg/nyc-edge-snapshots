@@ -383,53 +383,67 @@ async function fetchModel(forecastDate) {
     '&daily=temperature_2m_max,temperature_2m_min',
     '&temperature_unit=fahrenheit',
     '&windspeed_unit=mph',
-    '&forecast_days=3',
+    '&forecast_days=5',
     '&timezone=America%2FNew_York'
   ].join('');
 
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Open-Meteo failed: ${res.status}`);
-  const data = await res.json();
+  // Retry up to 3 times with 30s delay — Open-Meteo can be flaky at 1AM
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Open-Meteo returned ${res.status}`);
+      const data = await res.json();
 
-  const nextDate = new Date(forecastDate + 'T12:00:00');
-  nextDate.setDate(nextDate.getDate() + 1);
-  const nextDateStr = nextDate.toISOString().slice(0, 10);
+      const nextDate = new Date(forecastDate + 'T12:00:00');
+      nextDate.setDate(nextDate.getDate() + 1);
+      const nextDateStr = nextDate.toISOString().slice(0, 10);
 
-  // Use daily max/min as model high/low (captures intra-hour peaks)
-  const dateIdx = data.daily.time.indexOf(forecastDate);
-  const modelHigh = dateIdx >= 0 ? Math.round(data.daily.temperature_2m_max[dateIdx]) : null;
-  const modelLow = dateIdx >= 0 ? Math.round(data.daily.temperature_2m_min[dateIdx]) : null;
+      // Use daily max/min as model high/low (captures intra-hour peaks)
+      const dateIdx = data.daily.time.indexOf(forecastDate);
+      const modelHigh = dateIdx >= 0 ? Math.round(data.daily.temperature_2m_max[dateIdx]) : null;
+      const modelLow = dateIdx >= 0 ? Math.round(data.daily.temperature_2m_min[dateIdx]) : null;
 
-  const hourly = [];
-  data.hourly.time.forEach((t, i) => {
-    const tDate = t.slice(0, 10);
-    const tHour = parseInt(t.slice(11, 13));
-    const inWindow = (tDate === forecastDate && tHour >= 1) ||
-                     (tDate === nextDateStr && tHour === 0);
-    if (inWindow) {
-      hourly.push({
-        time: t,
-        temp: Math.round(data.hourly.temperature_2m[i]),
-        wind_dir: windDegToDir(data.hourly.winddirection_10m[i]),
-        wind_speed: data.hourly.windspeed_10m[i],
-        cloud: data.hourly.cloudcover[i],
-        dew: Math.round(data.hourly.dewpoint_2m[i]),
-        pop: data.hourly.precipitation_probability[i]
+      const hourly = [];
+      data.hourly.time.forEach((t, i) => {
+        const tDate = t.slice(0, 10);
+        const tHour = parseInt(t.slice(11, 13));
+        const inWindow = (tDate === forecastDate && tHour >= 1) ||
+                         (tDate === nextDateStr && tHour === 0);
+        if (inWindow) {
+          hourly.push({
+            time: t,
+            temp: Math.round(data.hourly.temperature_2m[i]),
+            wind_dir: windDegToDir(data.hourly.winddirection_10m[i]),
+            wind_speed: data.hourly.windspeed_10m[i],
+            cloud: data.hourly.cloudcover[i],
+            dew: Math.round(data.hourly.dewpoint_2m[i]),
+            pop: data.hourly.precipitation_probability[i]
+          });
+        }
       });
+
+      const afHours = data.hourly.time
+        .map((t, i) => ({ t, i, hour: parseInt(t.slice(11,13)), date: t.slice(0,10) }))
+        .filter(({date, hour}) => date === forecastDate && hour >= 13 && hour <= 17);
+
+      const afDirs = afHours.map(({i}) => windDegToDir(data.hourly.winddirection_10m[i])).filter(d => d !== '—');
+      const domDir = afDirs.length ?
+        afDirs.sort((a,b) => afDirs.filter(v=>v===a).length - afDirs.filter(v=>v===b).length).pop()
+        : '—';
+
+      console.log(`Model: high=${modelHigh}°F low=${modelLow}°F wind=${domDir}`);
+      return { modelHigh, modelLow, domDir, hourly };
+
+    } catch(e) {
+      console.warn(`Open-Meteo attempt ${attempt}/3 failed: ${e.message}`);
+      if (attempt < 3) {
+        console.log('Retrying in 30 seconds...');
+        await sleep(30000);
+      } else {
+        throw new Error(`Open-Meteo failed after 3 attempts: ${e.message}`);
+      }
     }
-  });
-
-  const afHours = data.hourly.time
-    .map((t, i) => ({ t, i, hour: parseInt(t.slice(11,13)), date: t.slice(0,10) }))
-    .filter(({date, hour}) => date === forecastDate && hour >= 13 && hour <= 17);
-
-  const afDirs = afHours.map(({i}) => windDegToDir(data.hourly.winddirection_10m[i])).filter(d => d !== '—');
-  const domDir = afDirs.length ?
-    afDirs.sort((a,b) => afDirs.filter(v=>v===a).length - afDirs.filter(v=>v===b).length).pop()
-    : '—';
-
-  console.log(`Model: high=${modelHigh}°F low=${modelLow}°F wind=${domDir}`);
-  return { modelHigh, modelLow, domDir, hourly };
+  }
 }
 
 // ── Save Snapshot ─────────────────────────────────────────────────────────────
@@ -621,13 +635,6 @@ async function runScoreJob() {
 async function runSnapshotJob() {
   const forecastDate = getTodayEastern();
   console.log(`=== Snapshot Job — ${forecastDate} ===`);
-
-  // Also grab the 1AM DSM while we're here
-  try {
-    await runDSMJob();
-  } catch(e) {
-    console.warn('DSM capture during snapshot job failed:', e.message);
-  }
 
   // Attempt scoring — CLI may not be posted yet at 1AM, that's ok
   // The 3AM score job will catch it reliably
