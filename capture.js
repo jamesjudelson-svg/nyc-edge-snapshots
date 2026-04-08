@@ -67,8 +67,9 @@ function getLSTWindow(dateStr) {
 // Job type: use JOB_TYPE env var if set, otherwise detect from UTC hour
 function detectJobType() {
   if (process.env.JOB_TYPE) {
-    console.log(`Job type from env: ${process.env.JOB_TYPE}`);
-    return process.env.JOB_TYPE;
+    const jt = process.env.JOB_TYPE.toLowerCase().trim();
+    console.log(`Job type from env: ${jt}`);
+    return jt;
   }
   const utcHour = new Date().getUTCHours();
   const utcMin = new Date().getUTCMinutes();
@@ -447,8 +448,16 @@ async function saveSnapshot(forecastDate, nwsData, modelData) {
     },
     body: JSON.stringify(snapshot)
   });
-  if (!res.ok) throw new Error(`Supabase save failed: ${res.status} - ${await res.text()}`);
-  console.log(`✅ Snapshot saved for ${forecastDate}`);
+  if (!res.ok) {
+    const err = await res.text();
+    if (res.status === 409) {
+      console.log(`Snapshot for ${forecastDate} already exists — skipping save, continuing to scoring`);
+    } else {
+      throw new Error(`Supabase save failed: ${res.status} - ${err}`);
+    }
+  } else {
+    console.log(`✅ Snapshot saved for ${forecastDate}`);
+  }
   return snapshot;
 }
 
@@ -467,8 +476,7 @@ async function runSnapshotJob() {
     const modelData = await fetchModel(forecastDate);
     await saveSnapshot(forecastDate, nwsData, modelData);
   } catch(e) {
-    console.error('Snapshot failed:', e.message);
-    process.exit(1);
+    console.error('Snapshot failed (non-fatal for scoring):', e.message);
   }
 
   // Step 2: Score yesterday with CLI retry loop
