@@ -1,27 +1,15 @@
 // capture.js
-// Runs via GitHub Actions on multiple schedules:
-//   05:00 UTC (1AM EDT)  — snapshot + score yesterday (with CLI retry) + 1AM DSM
-//   11:10 UTC (7:10AM EDT)  — DSM check
-//   17:10 UTC (1:10PM EDT)  — DSM check
-//   20:10 UTC (4:10PM EDT)  — DSM check
-//   23:10 UTC (7:10PM EDT)  — DSM check
+// Two jobs only:
+//   05:00 UTC (1AM EDT) — take today's snapshot
+//   07:00 UTC (3AM EDT) — score yesterday via CLI (with retry loop)
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY;
 const NWS_POINT = 'https://api.weather.gov/points/40.781,-73.967';
-const DSM_URLS = [
-  'https://tgftp.nws.noaa.gov/data/raw/cd/cdus41.kokx.dsm.txt',
-  'https://forecast.weather.gov/product.php?site=NWS&product=DSM&issuedby=NYC',
-  'https://mesonet.agron.iastate.edu/wx/afos/p.php?pil=DSMOKX&fmt=text'
-];
+const CLI_URL = 'https://forecast.weather.gov/product.php?site=OKX&product=CLI&issuedby=NYC';
 
-const DSM_MAX_RETRIES = 12;
-const DSM_RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
-
-// CLI retry config — CLI typically posts between 1AM and 3AM EDT
-// We retry for up to 2 hours before giving up
-const CLI_MAX_RETRIES = 24;
-const CLI_RETRY_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+const CLI_MAX_RETRIES = 24;          // 24 x 5min = 2 hours
+const CLI_RETRY_INTERVAL_MS = 5 * 60 * 1000;
 
 function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -64,23 +52,19 @@ function getLSTWindow(dateStr) {
   return { start, end };
 }
 
-// Job type: use JOB_TYPE env var if set, otherwise detect from UTC hour
 function detectJobType() {
   if (process.env.JOB_TYPE) {
-    const jt = process.env.JOB_TYPE.toLowerCase().trim();
-    console.log(`Job type from env: ${jt}`);
-    return jt;
+    return process.env.JOB_TYPE.toLowerCase().trim();
   }
   const utcHour = new Date().getUTCHours();
   const utcMin = new Date().getUTCMinutes();
   const utcDecimal = utcHour + utcMin / 60;
-  if (utcDecimal >= 4.5 && utcDecimal < 8.0) return 'snapshot'; // 1AM EDT window — handles both 1AM and any delayed 3AM
-  return 'dsm';
+  if (utcDecimal >= 4.5 && utcDecimal < 6.5) return 'snapshot'; // 1AM EDT = 05:00 UTC
+  if (utcDecimal >= 6.5 && utcDecimal < 9.0) return 'score';    // 3AM EDT = 07:00 UTC
+  return 'unknown';
 }
 
 // ── CLI ───────────────────────────────────────────────────────────────────────
-
-const CLI_URL = 'https://forecast.weather.gov/product.php?site=OKX&product=CLI&issuedby=NYC';
 
 function parseCLI(text, expectedDate) {
   const dateMatch = text.match(/CLIMATE SUMMARY FOR (\w+ \d+ \d+)/);
@@ -92,46 +76,42 @@ function parseCLI(text, expectedDate) {
   return { date: cliDate, high: parseInt(maxMatch[1]), low: parseInt(minMatch[1]) };
 }
 
-// Fetch CLI with retry loop — retries every 5 min for up to 2 hours
 async function fetchCLIWithRetry(expectedDate) {
-  console.log(`Fetching CLI for ${expectedDate} (will retry up to ${CLI_MAX_RETRIES}x)...`);
+  console.log(`Fetching CLI for ${expectedDate} (retrying up to ${CLI_MAX_RETRIES}x every 5min)...`);
   for (let attempt = 1; attempt <= CLI_MAX_RETRIES; attempt++) {
     try {
-      const res = await fetch(CLI_URL, { headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' } });
-      if (!res.ok) {
-        console.warn(`CLI fetch returned ${res.status}, retrying...`);
-      } else {
+      const res = await fetch(CLI_URL, {
+        headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' }
+      });
+      if (res.ok) {
         const text = await res.text();
         const parsed = parseCLI(text, expectedDate);
         if (parsed) {
-          console.log(`✅ CLI found: high=${parsed.high}°F low=${parsed.low}°F`);
+          console.log(`✅ CLI found on attempt ${attempt}: high=${parsed.high}°F low=${parsed.low}°F`);
           return parsed;
-        } else {
-          // Check what date the CLI has
-          const dateMatch = text.match(/CLIMATE SUMMARY FOR (\w+ \d+ \d+)/);
-          const cliDate = dateMatch ? new Date(dateMatch[1] + ' 12:00:00 EDT').toISOString().slice(0, 10) : 'unknown';
-          console.log(`CLI date is ${cliDate}, waiting for ${expectedDate} (attempt ${attempt}/${CLI_MAX_RETRIES})`);
         }
+        const dateMatch = text.match(/CLIMATE SUMMARY FOR (\w+ \d+ \d+)/);
+        const cliDate = dateMatch ? new Date(dateMatch[1] + ' 12:00:00 EDT').toISOString().slice(0, 10) : 'unknown';
+        console.log(`CLI shows ${cliDate}, need ${expectedDate} (attempt ${attempt}/${CLI_MAX_RETRIES})`);
+      } else {
+        console.warn(`CLI returned ${res.status} (attempt ${attempt}/${CLI_MAX_RETRIES})`);
       }
     } catch(e) {
-      console.warn(`CLI fetch attempt ${attempt} failed: ${e.message}`);
+      console.warn(`CLI fetch failed: ${e.message} (attempt ${attempt}/${CLI_MAX_RETRIES})`);
     }
-    if (attempt < CLI_MAX_RETRIES) {
-      console.log(`Retrying CLI in 5 minutes...`);
-      await sleep(CLI_RETRY_INTERVAL_MS);
-    }
+    if (attempt < CLI_MAX_RETRIES) await sleep(CLI_RETRY_INTERVAL_MS);
   }
   console.error(`❌ CLI not available for ${expectedDate} after ${CLI_MAX_RETRIES} attempts`);
   return null;
 }
 
-// ── Score Yesterday ───────────────────────────────────────────────────────────
+// ── Score Job ─────────────────────────────────────────────────────────────────
 
-async function scoreYesterday(withRetry = false) {
+async function runScoreJob() {
   const yesterday = getYesterdayEastern();
-  console.log(`Attempting to score ${yesterday}...`);
+  console.log(`=== Score Job — scoring ${yesterday} ===`);
 
-  // Check if already scored
+  // Already scored?
   const checkRes = await fetch(
     `${SUPABASE_URL}/rest/v1/scored_days?date=eq.${yesterday}`,
     { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
@@ -139,36 +119,24 @@ async function scoreYesterday(withRetry = false) {
   const existing = await checkRes.json();
   if (existing.length > 0) {
     console.log(`${yesterday} already scored, skipping`);
-    return true;
+    return;
   }
 
-  // Get yesterday's snapshot
+  // Get snapshot
   const snapRes = await fetch(
     `${SUPABASE_URL}/rest/v1/snapshots?date=eq.${yesterday}`,
     { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
   );
   const snaps = await snapRes.json();
   if (!snaps.length) {
-    console.log(`No snapshot found for ${yesterday}, cannot score`);
-    return false;
+    console.error(`No snapshot found for ${yesterday} — cannot score`);
+    return;
   }
   const snap = snaps[0];
 
-  // Fetch CLI — with or without retry depending on caller
-  const cli = withRetry
-    ? await fetchCLIWithRetry(yesterday)
-    : await (async () => {
-        try {
-          const res = await fetch(CLI_URL, { headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' } });
-          const text = await res.text();
-          return parseCLI(text, yesterday);
-        } catch(e) { return null; }
-      })();
-
-  if (!cli) {
-    console.log(`CLI not available for ${yesterday} — scoring skipped`);
-    return false;
-  }
+  // Fetch CLI with retry
+  const cli = await fetchCLIWithRetry(yesterday);
+  if (!cli) return;
 
   // Save to cli_reports
   await fetch(`${SUPABASE_URL}/rest/v1/cli_reports`, {
@@ -186,7 +154,7 @@ async function scoreYesterday(withRetry = false) {
       actual_low: cli.low
     })
   });
-  console.log(`✅ CLI saved for ${yesterday}: high=${cli.high}°F low=${cli.low}°F`);
+  console.log(`✅ CLI saved: high=${cli.high}°F low=${cli.low}°F`);
 
   // Score
   const scored = {
@@ -225,118 +193,6 @@ async function scoreYesterday(withRetry = false) {
   console.log(`✅ Scored ${yesterday}: high=${cli.high}°F low=${cli.low}°F`);
   console.log(`   Model high err: ${scored.model_high_err}°F | NWS high err: ${scored.nws_high_err}°F`);
   console.log(`   Winner high: ${scored.winner_high} | Winner low: ${scored.winner_low}`);
-  return true;
-}
-
-// ── DSM ───────────────────────────────────────────────────────────────────────
-
-function parseDSMText(text) {
-  if (!text) return null;
-  let raw = text;
-  if (text.includes('<html') || text.includes('<HTML')) {
-    const preMatch = text.match(/<pre[^>]*>([\s\S]*?)<\/pre>/i);
-    if (preMatch) {
-      raw = preMatch[1].replace(/&amp;/g,'&').replace(/&lt;/g,'<').replace(/&gt;/g,'>');
-    } else {
-      const dsmIdx = text.indexOf('DSMNYC');
-      if (dsmIdx === -1) return null;
-      raw = text.slice(dsmIdx - 100, dsmIdx + 500);
-    }
-  }
-  if (!raw.includes('DSMNYC')) return null;
-  const headerMatch = raw.match(/CXUS41 KOKX (\d{2})(\d{2})(\d{2})/);
-  if (!headerMatch) return null;
-  const issuanceUTCHour = parseInt(headerMatch[2]);
-  const issuanceUTCMin = parseInt(headerMatch[3]);
-  const dataMatch = raw.match(/KNYC DS (\d{4}) (\d{2})\/(\d{2})\s+(\d+)(\d{4})\/\s*(\d+)(\d{4})/);
-  if (!dataMatch) return null;
-  const high = parseInt(dataMatch[4]);
-  const highTimeLST = dataMatch[5];
-  const low = parseInt(dataMatch[6]);
-  const lowTimeLST = dataMatch[7];
-  const highH = parseInt(highTimeLST.slice(0, 2)) + 1;
-  const highM = highTimeLST.slice(2, 4);
-  const lowH = parseInt(lowTimeLST.slice(0, 2)) + 1;
-  const lowM = lowTimeLST.slice(2, 4);
-  const highTimeStr = `${String(highH).padStart(2, '0')}:${highM} EDT`;
-  const lowTimeStr = `${String(lowH).padStart(2, '0')}:${lowM} EDT`;
-  const issuanceKey = `${String(issuanceUTCHour).padStart(2, '0')}${String(issuanceUTCMin).padStart(2, '0')}`;
-  return { high, low, highTimeStr, lowTimeStr, issuanceKey, issuanceUTCHour, issuanceUTCMin };
-}
-
-async function getLastDSMIssuanceKey(date) {
-  try {
-    const res = await fetch(
-      `${SUPABASE_URL}/rest/v1/dsm_reports?date=eq.${date}&order=captured_at.desc&limit=1`,
-      { headers: { 'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`, 'apikey': SUPABASE_SERVICE_KEY } }
-    );
-    if (!res.ok) return null;
-    const rows = await res.json();
-    return rows.length ? rows[0].issuance_key : null;
-  } catch(e) {
-    console.warn('Could not read last DSM from Supabase:', e.message);
-    return null;
-  }
-}
-
-async function saveDSM(date, parsed) {
-  const record = {
-    date,
-    captured_at: new Date().toISOString(),
-    high: parsed.high,
-    low: parsed.low,
-    high_time_str: parsed.highTimeStr,
-    low_time_str: parsed.lowTimeStr,
-    issuance_key: parsed.issuanceKey
-  };
-  const res = await fetch(`${SUPABASE_URL}/rest/v1/dsm_reports`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': `Bearer ${SUPABASE_SERVICE_KEY}`,
-      'apikey': SUPABASE_SERVICE_KEY,
-      'Prefer': 'resolution=merge-duplicates'
-    },
-    body: JSON.stringify(record)
-  });
-  if (!res.ok) throw new Error(`DSM save failed: ${res.status} - ${await res.text()}`);
-  console.log(`✅ DSM saved: high=${parsed.high}°F @ ${parsed.highTimeStr}, low=${parsed.low}°F @ ${parsed.lowTimeStr}`);
-  return record;
-}
-
-async function runDSMJob() {
-  const date = getTodayEastern();
-  console.log(`=== DSM Check Job — ${date} ===`);
-  const lastKey = await getLastDSMIssuanceKey(date);
-  console.log(`Last known DSM issuance key: ${lastKey || 'none'}`);
-  let attempt = 0;
-  while (attempt < DSM_MAX_RETRIES) {
-    attempt++;
-    console.log(`Attempt ${attempt}/${DSM_MAX_RETRIES} — fetching DSM...`);
-    try {
-      let text = null;
-      for (const url of DSM_URLS) {
-        try {
-          const res = await fetch(url, { headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' } });
-          if (!res.ok) { console.warn(`  ${url} returned ${res.status}`); continue; }
-          const t = await res.text();
-          if (t && t.includes('DSMNYC')) { console.log(`  Got DSM from: ${url}`); text = t; break; }
-        } catch(urlErr) { console.warn(`  ${url} failed: ${urlErr.message}`); }
-      }
-      if (!text) { console.warn('All DSM URLs failed, retrying in 5 minutes...'); await sleep(DSM_RETRY_INTERVAL_MS); continue; }
-      const parsed = parseDSMText(text);
-      if (!parsed) { console.warn('Could not parse DSM, retrying in 5 minutes...'); await sleep(DSM_RETRY_INTERVAL_MS); continue; }
-      console.log(`DSM issuance key: ${parsed.issuanceKey} (last: ${lastKey || 'none'})`);
-      if (parsed.issuanceKey === lastKey) { console.log('DSM not updated yet, retrying in 5 minutes...'); await sleep(DSM_RETRY_INTERVAL_MS); continue; }
-      await saveDSM(date, parsed);
-      console.log('DSM job complete.');
-      return;
-    } catch(e) {
-      console.warn(`Attempt ${attempt} failed: ${e.message}`);
-      if (attempt < DSM_MAX_RETRIES) { await sleep(DSM_RETRY_INTERVAL_MS); }
-    }
-  }
-  console.error(`❌ DSM job exhausted ${DSM_MAX_RETRIES} retries.`);
 }
 
 // ── NWS ───────────────────────────────────────────────────────────────────────
@@ -344,10 +200,10 @@ async function runDSMJob() {
 async function fetchNWS(forecastDate) {
   console.log('Fetching NWS forecast...');
   const pointsRes = await fetch(NWS_POINT, { headers: { 'User-Agent': 'nyc-edge-snapshots/1.0' } });
-  if (!pointsRes.ok) throw new Error(`NWS points API failed: ${pointsRes.status}`);
+  if (!pointsRes.ok) throw new Error(`NWS points failed: ${pointsRes.status}`);
   const pointsData = await pointsRes.json();
   const forecastRes = await fetch(pointsData.properties.forecastHourly, { headers: { 'User-Agent': 'nyc-edge-snapshots/1.0' } });
-  if (!forecastRes.ok) throw new Error(`NWS hourly forecast failed: ${forecastRes.status}`);
+  if (!forecastRes.ok) throw new Error(`NWS hourly failed: ${forecastRes.status}`);
   const forecastData = await forecastRes.json();
   const periods = forecastData.properties.periods;
   const { start, end } = getLSTWindow(forecastDate);
@@ -417,14 +273,19 @@ async function fetchModel(forecastDate) {
       return { modelHigh, modelLow, domDir, hourly };
     } catch(e) {
       console.warn(`Open-Meteo attempt ${attempt}/3 failed: ${e.message}`);
-      if (attempt < 3) { await sleep(30000); } else { throw new Error(`Open-Meteo failed: ${e.message}`); }
+      if (attempt < 3) await sleep(30000);
+      else throw new Error(`Open-Meteo failed after 3 attempts: ${e.message}`);
     }
   }
 }
 
-// ── Save Snapshot ─────────────────────────────────────────────────────────────
+// ── Snapshot Job ──────────────────────────────────────────────────────────────
 
-async function saveSnapshot(forecastDate, nwsData, modelData) {
+async function runSnapshotJob() {
+  const forecastDate = getTodayEastern();
+  console.log(`=== Snapshot Job — ${forecastDate} ===`);
+  const nwsData = await fetchNWS(forecastDate);
+  const modelData = await fetchModel(forecastDate);
   const regime = windRegime(nwsData.domDir);
   const snapshot = {
     date: forecastDate,
@@ -451,63 +312,12 @@ async function saveSnapshot(forecastDate, nwsData, modelData) {
   if (!res.ok) {
     const err = await res.text();
     if (res.status === 409) {
-      console.log(`Snapshot for ${forecastDate} already exists — skipping save, continuing to scoring`);
+      console.log(`Snapshot for ${forecastDate} already exists — skipping`);
     } else {
-      throw new Error(`Supabase save failed: ${res.status} - ${err}`);
+      throw new Error(`Snapshot save failed: ${res.status} - ${err}`);
     }
   } else {
     console.log(`✅ Snapshot saved for ${forecastDate}`);
-  }
-  return snapshot;
-}
-
-// ── Snapshot Job (1AM EDT) ────────────────────────────────────────────────────
-// Does everything: score yesterday (with CLI retry), take today's snapshot, check 1AM DSM
-
-async function runSnapshotJob() {
-  const forecastDate = getTodayEastern();
-  console.log(`=== Snapshot Job — ${forecastDate} ===`);
-
-  // Step 1: Take today's snapshot FIRST — locks in 1AM forecast values
-  // before the CLI retry loop potentially delays us by 2 hours
-  console.log('--- Step 1: Take snapshot ---');
-  try {
-    const nwsData = await fetchNWS(forecastDate);
-    const modelData = await fetchModel(forecastDate);
-    await saveSnapshot(forecastDate, nwsData, modelData);
-  } catch(e) {
-    console.error('Snapshot failed (non-fatal for scoring):', e.message);
-  }
-
-  // Step 2: Score yesterday with CLI retry loop
-  // CLI typically posts between 1AM and 3AM EDT — we wait up to 2 hours
-  console.log('--- Step 2: Score yesterday ---');
-  try {
-    const scored = await scoreYesterday(true); // true = use retry loop
-    if (!scored) console.log('Scoring did not complete — CLI may not have posted in time');
-  } catch(e) {
-    console.error('Scoring error (non-fatal):', e.message);
-  }
-
-  // Step 3: Check 1AM DSM (quick, no retry — just grab whatever is there)
-  console.log('--- Step 3: 1AM DSM check ---');
-  try {
-    const lastKey = await getLastDSMIssuanceKey(forecastDate);
-    for (const url of DSM_URLS) {
-      try {
-        const res = await fetch(url, { headers: { 'User-Agent': 'nyc-edge-snapshots/1.0', 'Cache-Control': 'no-cache' } });
-        if (!res.ok) continue;
-        const text = await res.text();
-        if (!text.includes('DSMNYC')) continue;
-        const parsed = parseDSMText(text);
-        if (!parsed) continue;
-        if (parsed.issuanceKey === lastKey) { console.log('No new DSM at 1AM — DSM jobs will pick it up later'); break; }
-        await saveDSM(forecastDate, parsed);
-        break;
-      } catch(e) { continue; }
-    }
-  } catch(e) {
-    console.warn('1AM DSM check failed (non-fatal):', e.message);
   }
 }
 
@@ -518,12 +328,14 @@ async function main() {
   if (!SUPABASE_URL || !SUPABASE_SERVICE_KEY) throw new Error('Missing SUPABASE_URL or SUPABASE_SERVICE_KEY');
 
   const jobType = detectJobType();
-  console.log(`Job type detected: ${jobType}`);
+  console.log(`Job type: ${jobType}`);
 
   if (jobType === 'snapshot') {
     await runSnapshotJob();
+  } else if (jobType === 'score') {
+    await runScoreJob();
   } else {
-    await runDSMJob();
+    console.log(`Unknown job type: ${jobType} — nothing to do`);
   }
 
   console.log('=== Done ===');
