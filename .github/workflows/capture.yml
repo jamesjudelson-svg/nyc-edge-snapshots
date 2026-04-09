@@ -1,20 +1,14 @@
 name: NYC Edge Snapshots
 on:
   schedule:
-    # 1AM EDT (05:00 UTC) — snapshot + score yesterday (CLI retry) + 1AM DSM
+    # 1AM EDT (05:00 UTC) — snapshot
     - cron: '0 5 * * *'
-    # 7:10AM EDT (11:10 UTC) — DSM check
-    - cron: '10 11 * * *'
-    # 1:10PM EDT (17:10 UTC) — DSM check
-    - cron: '10 17 * * *'
-    # 4:10PM EDT (20:10 UTC) — DSM check
-    - cron: '10 20 * * *'
-    # 7:10PM EDT (23:10 UTC) — DSM check
-    - cron: '10 23 * * *'
+    # 3AM EDT (07:00 UTC) — score yesterday via CLI
+    - cron: '0 7 * * *'
   workflow_dispatch:
     inputs:
       job_type:
-        description: 'Job type override (snapshot, dsm, score_only)'
+        description: 'Job type override: snapshot or score'
         required: false
         default: ''
 jobs:
