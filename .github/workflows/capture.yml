@@ -3,8 +3,8 @@ on:
   schedule:
     # 1AM EDT (05:00 UTC) — snapshot
     - cron: '0 5 * * *'
-    # 3AM EDT (07:00 UTC) — score yesterday via CLI
-    - cron: '0 7 * * *'
+    # 6AM EDT (10:00 UTC) — score yesterday via CLI
+    - cron: '0 10 * * *'
   workflow_dispatch:
     inputs:
       job_type:
@@ -26,5 +26,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          JOB_TYPE: ${{ github.event.inputs.job_type || (github.event.schedule == '0 5 * * *' && 'snapshot' || (github.event.schedule == '0 7 * * *' && 'score' || '')) }}
+          JOB_TYPE: ${{ github.event.inputs.job_type || (github.event.schedule == '0 5 * * *' && 'snapshot' || (github.event.schedule == '0 10 * * *' && 'score' || '')) }}
         run: node capture.js
