@@ -26,5 +26,5 @@ jobs:
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
-          JOB_TYPE: ${{ github.event.inputs.job_type }}
+          JOB_TYPE: ${{ github.event.inputs.job_type || (github.event.schedule == '0 5 * * *' && 'snapshot' || (github.event.schedule == '0 7 * * *' && 'score' || '')) }}
         run: node capture.js
